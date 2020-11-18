@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*
+"""
+---------------------
+SOFTWARE DESCRIPTION:
+---------------------
+Written October 2018 -- Nicholas Jannsen
+Typeset in Python 3
+
+This python class is specifically made for the spectroscopic data reduction of the Shelyak eShel spectrograph
+which is installed at the Hertzsprung SONG node telescope at Tenrife, Spain. The software is originally built
+from structures of the 'SONGWriter' which is SONG's spectroscopic data reduction pipeline, and by others is 
+inspired by the data reduction pipeline 'FIESTools' of the FIES spectrograph at the NOT on La Palma.
+
+This function needs to be called from a terminal:
+export PATH=$PATH:.
+chmod +x lollipop
+lollipop [-h] [-p] [-r] <path>
+"""
+# Numpy:
+import numpy as np
+# Astropy:
+from astropy.io import fits
+from astropy.time import Time
+#from astropy.coordinates import SkyCoord, EarthLocation
+# PyAstronomy:
+import PyAstronomy as pyas
+# SciPy:
+import scipy
+import scipy.constants
+import scipy.io
+import scipy.ndimage
+from scipy.ndimage import median_filter
+# Matplotlib:
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+#from tikzplotlib import save as tikz_save
+# Others:
+import os          # Miscellaneous operating system interfaces
+import sys         # System-specific parameters and functions (Parsing arguments)
+import getopt      # Parsing command-line arguments
+import math
+import time
+import glob
+import pylab
+import heapq
+import bottleneck
+from skimage import feature as skfeature
+# Error of propagation (nominal_value, std_dev):
+import uncertainties.unumpy as up
+from uncertainties import ufloat
+def val(x): return up.nominal_values(x)
+def err(x): return up.std_devs(x)
+# Producing colored terminal text and cursor positioning
+from colorama import Fore, Style, Back 
+# Utilities made for nice illustrations of software:
+import plottools as pt
+# Global settings for out-print to terminal (allow more digits and nice coloum ordering):
+np.set_printoptions(suppress=True, formatter={'float_kind':'{:7.5f}'.format}, linewidth=100)
+
+#--------------------------------------------------------------#
+#                          DEFINE CLASS                        #
+#--------------------------------------------------------------#
+
+class MasterClass(object):
+
+    # INITILIZE THE CLASS: 
+    def __init__(self, plot, redo, path):
+        # Define input parameters:
+        self.plot = plot    
+        self.redo = redo    
+        self.path = path
+        
+        # Load image files:
+        self.imgfiles = np.sort(glob.glob('{}AL*'.format(self.path)))
+        if len(self.imgfiles)==0:
+            print(Fore.RED+Style.BRIGHT+'[ERROR]: No data from path!'+Style.RESET_ALL); sys.exit()
+        # Load header of image files:
+        hduls    = np.array([fits.open(str(files)) for files in self.imgfiles])
+        self.n   = len(self.imgfiles)
+        self.dex = range(self.n)
+        # Function for fits header extraction:
+        def headers(name):
+            return [hduls[i][0].header['{}'.format(name)] for i in range(len(self.imgfiles))]
+        # Sepearte image files:
+        self.imgtype = headers('IMAGETYP')
+        self.BF_dex = np.where(np.array(self.imgtype)=='BIAS')[0]      # Bias
+        self.FF_dex = np.where(np.array(self.imgtype)=='FLAT,LAMP')[0] # Halogen spectroflat
+        self.AF_dex = np.where(np.array(self.imgtype)=='WAVE,LAMP')[0] # HeNe wavelength calib
+        self.SF_dex = np.where(np.array(self.imgtype)=='STD')[0]       # Standard FGK star
+        self.TF_dex = np.where(np.array(self.imgtype)=='OBJECT')[0]    # Target(s)
+        # Check if all images are present:
+        if len(self.BF_dex)==0:
+            print(Fore.RED+Style.BRIGHT+'[ERROR]: No bias images are present!'); sys.exit()
+        if len(self.FF_dex)==0:
+            print(Fore.RED+Style.BRIGHT+'[ERROR]: No flat images are present!'); sys.exit()
+        if len(self.AF_dex)==0:
+            print(Fore.RED+Style.BRIGHT+'[ERROR]: No arc images are present!'); sys.exit()
+        if len(self.SF_dex)==0:
+            print(Fore.RED+Style.BRIGHT+'[ERROR]: No spectroscopic standard is present!'); sys.exit()
+        if len(self.TF_dex)==0:
+            print(Fore.RED+Style.BRIGHT+'[ERROR]: No target images are present!'); sys.exit()
+        # If no target is available select standard star for reduction:
+        if len(self.TF_dex)==0: self.TF_dex = self.SF_dex  
+        # Observation information:
+        self.datetime = [headers('DATE-OBS')[i][:10] for i in range(self.n)] # UTC-date of observation
+        self.filename = [headers('FILENAME')[i][:10] for i in range(self.n)] # NOT-date of observation
+        self.notdate  = [headers('FILENAME')[i][:6]  for i in range(self.n)] # NOT-date of observation
+        self.target   = headers('TCSTGT')[self.TF_dex[0]]
+        self.exptime  = headers('EXPTIME')
+        # Check if target are observed at high airmass':
+        self.airmass = headers('AIRMASS')[self.TF_dex[0]]
+        if self.airmass > 2.5:
+            print(Fore.YELLOW+'[WARNING]: Target is observed at Airmass > 2.5 (Altitude < 22 deg)'\
+                  +Style.RESET_ALL)
+        # Check if all image sizes are equal:
+        detector = headers('DETWIN1')
+        for i in range(self.n-1):
+            try: detector[i] is detector[i+1]
+            except ValueError:
+                print(Fore.RED+Style.BRIGHT+'[ERROR]: Image sizes are not equal!')
+            else: pass
+        # Dimension constants and arrays:
+        detector = [l.split(':') for l in detector[self.TF_dex[0]].strip(']:[').split(', ')]
+        self.len_disp  = int(detector[0][1])-int(detector[0][0])  # [pixel] Height of image (int)
+        self.len_cross = int(detector[1][1])-int(detector[1][0])  # [pixel] Width  of image (int)
+        self.cen_disp  = int(self.len_disp/2)       # [pixel] Center position of disp  (int)
+        self.cen_cross = int(self.len_cross/2)      # [pixel] Center position of cross (int)
+        self.disp      = np.arange(self.len_disp)   # [pixel] Integers spanning disp (array)
+        # Check binning:
+        self.binning = headers('DETXBIN')[self.TF_dex[0]]
+        if self.binning > 1:
+            print(Fore.YELLOW+'[WARNING]: The CCD images are using binning %s!'\
+                  % self.binning+Style.RESET_ALL)
+        # Check CCD temperature:
+        ccdtemp = headers('CCDTEMP')
+        for i in self.dex:
+            if ccdtemp[i] > -110:
+                print(Fore.YELLOW+\
+                      '[WARNING]: The CCD temperature for frame %s is > -110 degC (%s degC)!'\
+                      % (self.filename[i], ccdtemp[i])+Style.RESET_ALL)
+        # CCD properties:
+        self.gain     = 2.2         # gain (electrons/ADU)   
+        self.ron      = 10000       # read out noise (electrons)
+        self.satlevel = 150000      # Saturation level of CCD4 ALFOSC
+        
+    #--------------------------------------------------------------------------------#
+    #                                 IMAGE REDUCTION                                #
+    #--------------------------------------------------------------------------------#
+    def image_reduction(self):
+        """
+        This routine takes data path and loads all image files given in the directory. 
+        It combines the bias, spectroflat (Halogen), and arcs (HeNe) frames and make 
+        master frames used for the image reduction of the science frames. All calibration
+        frames are saved with the abbreviation name following an extensions of the date
+        given in NOT format.
+        ----------------------------
+                   OUTPUT          :
+        ----------------------------
+        BF, FF, AF, SF, TF  (array): Master and reduced images parsed
+        BF, FF, AF, SF, TF   (fits): Master and reduced images saved to fits 
+        """
+        #------------------------------------------
+        # TEST IF CALIBRATION IMAGES ALREADY EXIST:
+        #------------------------------------------
+        try:
+            BF = fits.open('{}BF_{}.fits'.format(self.path, self.notdate[0]))[0].data
+            FF = fits.open('{}FF_{}.fits'.format(self.path, self.notdate[0]))[0].data
+            AF = fits.open('{}AF_{}.fits'.format(self.path, self.notdate[0]))[0].data
+            SF = fits.open('{}SF_{}.fits'.format(self.path, self.notdate[0]))[0].data
+            TF = fits.open('{}TF_{}.fits'.format(self.path, self.notdate[0]))[0].data
+        except IOError: 
+            BF = []
+
+        #-------------------------
+        # ELSE USE AVAILABLE DATA:
+        #-------------------------
+        if BF==[] or self.redo==True:
+            # Find all calibration images:
+            BF_i = np.array([fits.getdata(str(self.imgfiles[i])) for i in self.BF_dex])
+            FF_i = np.array([fits.getdata(str(self.imgfiles[i])) for i in self.FF_dex])
+            AF_i = np.array([fits.getdata(str(self.imgfiles[i])) for i in self.AF_dex])
+            SF_i = np.array([fits.getdata(str(self.imgfiles[i])) for i in self.SF_dex])
+            TF_i = np.array([fits.getdata(str(self.imgfiles[i])) for i in self.TF_dex])
+
+            # Make master bias: 
+            BF = np.median(BF_i, axis=0)
+
+            # Make master flat from overscan region:
+            FF_pre   = np.median(FF_i - BF, axis=0)
+            
+            overscan = np.median(FF_pre[self.len_cross-35:,:])
+            FF       = FF_pre - overscan*np.ones(np.shape(FF_pre))
+            FF = np.absolute(FF)
+            
+            # Make master arc:
+            AF = np.median(AF_i - BF, axis=0)
+
+            # Calibrate science frames:
+            SF = (SF_i[0] - BF)#/(FF/np.max(FF))
+            print(np.median(FF), np.max(FF))
+            plt.imshow((FF/np.max(FF)), vmin=5000, vmax=15000, cmap='gray')
+            plt.colorbar()
+            plt.show()
+            sys.exit()
+            
+            # Find hdulists:
+            BF_hdul = self.hdul[self.BF_dex[0]][0].header
+            DF_hdul = self.hdul[self.DF_dex[0]][0].header
+            FF_hdul = self.hdul[self.FF_dex[0]][0].header
+            AF_hdul = self.hdul[self.AF_dex[0]][0].header
+
+            # Save master calibration images:
+            # fits.writeto('{}BF_{}.fits'.format(self.path, self.date), BF, BF_hdul, overwrite=True)
+            # fits.writeto('{}DF_{}.fits'.format(self.path, self.date), DF, DF_hdul, overwrite=True)
+            # fits.writeto('{}FF_{}.fits'.format(self.path, self.date), FF, FF_hdul, overwrite=True)
+            # fits.writeto('{}AF_{}.fits'.format(self.path, self.date), AF, AF_hdul, overwrite=True)
+
+            # Save calibrated science frames one by one:        
+            for i in range(len(self.SF_dex)):
+                SF_hdul = self.hdul[self.SF_dex[i]][0].header
+                header  = self.hdul[self.SF_dex[i]][0].header['DATE-OBS']
+                fits.writeto('{}SF_{}.fits'.format(self.path, header), SF[0], SF_hdul, overwrite=True)
+            # Only use first image if routine is running furter:
+            SF = SF[0]
+
+        #-----------------------------
+        # LOAD RV AMPLITUDE OF OBJECT:
+        #-----------------------------
+        file_object = glob.glob('{}SF*'.format(self.path))
+        hdul_object = fits.open(str(file_object[0]))
+        self.rv_amp = hdul_object[0].header['OBJ-RV']   # [km/s] CDS RV amplitude (float)
+        
+        #-----------------------------------------------------------
+        if plot==1: pt.plot_image_reduction(BF, DF, FF, AF, SF)
+        #-----------------------------------------------------------
+        # Select spectral region of interest:
+        self.BF = BF; self.DF = DF; self.FF = FF; self.AF = AF
+        self.F_calib = FF[self.cross_cut[0]:self.cross_cut[1], :].T
+        self.T_calib = AF[self.cross_cut[0]:self.cross_cut[1], :].T
+        self.S_calib = SF[self.cross_cut[0]:self.cross_cut[1], :].T
+        self.noise   = np.sqrt(np.mean(BF**2))
+        #-----------------------------------------------------------
+        return
+
+    #--------------------------------------------------------------------------------#
+    #                                   TRACE ORDERS                                 #
+    #--------------------------------------------------------------------------------#
+    
+    def trace_orders(self, data=None, smooth_win=10, exclude_border=10, min_order_width=40, \
+                     threshold_abs=0, disp_gap_tol=5, num_orders=1, num_peaks=10, plot=0):
+        """
+        This function find the orders in an eshel spectrum by tracing the maximum light 
+        distribution along each order. First the function finds a center order position
+        and use this as a reference. Next the function finds the ridges of the specified
+        number of order 'num_orders' using the skfeature package. Lastely, each order is
+        the discribed by a 5 order polynomial and returned as output.
+        ----------------------------
+                    INPUT          :
+        ----------------------------
+        data                (array): A single image
+        smooth_win          (float): Smooth value to enhance orders
+        exclude_border      (float): Border edges that should be exluded
+        order_min_width     (float): Minimum distance to locate where the orders are 
+        threshold_abs       (float): Threshold used to locate peaks with skfeature
+        disp_gap_tol        (float): Tolerance for how big a gap there may be
+        num_orders          (float): User specified number of orders the program should find
+        num_peaks           (float): Number of peaks found for each bin 
+        ----------------------------
+                   OUTPUT          :
+        ----------------------------
+        order_traces         (dict): Orders within 'order x' and corresponding array with polynomials
+        """
+        #------------------------------
+        # CHECK FOR PROGRAM PARAMETERS:
+        #------------------------------
+        if data==None:
+            data = np.array([fits.getdata(str(self.imgfiles[i])) for i in self.SF_dex])[0]
+            
+            # plt.imshow(data, vmin=11000, vmax=15000, cmap='gray')
+            # plt.colorbar()
+            # plt.show()
+
+        #----------------------------------
+        # FIND CENTRAL REFERENCE POSITIONS:
+        #----------------------------------
+        # Central position interval 
+        ref_int     = [self.cen_disp-5, self.cen_disp+6]
+        ref_cen_pos = self.find_ref_cen_pos(data, ref_int, smooth_win, exclude_border, min_order_width,\
+                                            threshold_abs, num_orders, plot)
+        
+        #------------------------
+        # TRACE THE ORDER RIDGES:
+        #------------------------
+        ridge_pos_cross, ridge_pos_disp = self.find_order_ridges(data, smooth_win, exclude_border,\
+                                                                 min_order_width, threshold_abs, \
+                                                                 num_peaks)
+        #------------------------------------
+        # FILL IN DATA INTO THE FOUND RIDGES:
+        #------------------------------------      
+        # Make dict placeholders:
+        order_traced = {}
+        order_trace  = {}
+        for i, order_pos in enumerate(np.sort(ref_cen_pos)[::-1]):
+            # Here "order_pos" is the cross dispersion center value. order_pos[0] simply chooses one
+            # value and not the increasing list within the loop.
+            # Using ridges trace each order in each direction:
+            min_order_width = 10
+            order_trace_cross, order_trace_disp = self.find_order_outliers(self.cen_disp, order_pos[0],\
+                                                                           ridge_pos_disp, ridge_pos_cross,\
+                                                                           min_order_width, disp_gap_tol)
+            # Fit ridges with polynomial:
+            poly_coefs = np.polyfit(order_trace_disp, order_trace_cross, 5)
+            order_traced['order_{}'.format(i)] = poly_coefs
+            order_trace['order_{}'.format(i)]  = [order_trace_disp, order_trace_cross]
+        
+        #-----------------------------------------------------------------------------
+        if self.plot==True:
+            pt.plot_trace_order(ridge_pos_disp, ridge_pos_cross, order_trace, order_traced, \
+                                order_trace_disp, self.cen_disp, ref_cen_pos)
+        #-----------------------------------------------------------------------------
+        self.ref_cen_pos = ref_cen_pos
+        self.trace = order_traced
+        #-----------------------------------------------------------------------------
+        print(order_traced)
+        return order_traced
+    
+
+    def find_ref_cen_pos(self, data, ref_int, smooth_win, exclude_border, min_distance, threshold_abs, \
+                         num_peaks, plot):
+        """
+        This function finds the center order position used as a reference.  
+        """
+        # Collapse in disp direction to reduce cosmic ray contamination:
+        # (FIXME done to make this robust against cosmics - maybe it is not needed)
+        center_rows_median = np.median(data[ref_int[0]:ref_int[1], :], axis=0)
+        # Smooth cross_dispersion direction to prepare for the peak-detection algorithm:
+        center_row_median_convolved = bottleneck.move_sum(center_rows_median.astype(np.float), \
+                                                          smooth_win, min_count=1) 
+        # Find orders using a peak detection function from scikit-image:
+        order_centres = skfeature.peak_local_max(center_row_median_convolved, \
+                                                 exclude_border=exclude_border,\
+                                                 min_distance=min_distance, threshold_rel=0,\
+                                                 threshold_abs=threshold_abs, num_peaks=num_peaks)
+        # Peaks detected minus the smooth window applied (simply due to the moving sum of bottleneck):
+        ref_cen_pos = order_centres - int(smooth_win/2)
+        #------------------------------------------------------------------------------
+        if self.plot==True:
+            pt.plot_find_ref_cen_pos(center_rows_median, center_row_median_convolved, \
+                                     self.len_cross, smooth_win, ref_cen_pos)
+        #------------------------------------------------------------------------------
+        return ref_cen_pos
+
+
+    def find_order_ridges(self, data, smooth_win, exclude_border, min_distance, threshold_abs, num_peaks):
+        """
+        This function finds the ridge of each order. It does so by making a slice in cross dispersion and
+        colvolve that with a smooth filter such as the "bottleneck.move_sum". It then finds the local max
+        for each slice and saves the position
+        """
+        # Placeholders:
+        ridge_indices_disp  = []
+        ridge_indices_cross = []
+        # Loop over the dispersion length (i) and the cross order row:
+        for i, crossorder in enumerate(data):
+            # Collapse in dispersion axis:
+            # TODO should smoothing be handled separately?
+            top_hat_conv = bottleneck.move_sum(crossorder.astype(np.float), smooth_win, min_count=1)
+            # Again find the peaks as done in "find_ref_cen_pos":
+            peaks = skfeature.peak_local_max(top_hat_conv, exclude_border=exclude_border,\
+                                             min_distance=min_distance, threshold_rel=0,\
+                                             threshold_abs=threshold_abs, indices=True, num_peaks=num_peaks)
+            # Convert peaks to a list covering the ridges:
+            peaks -= int(smooth_win/2)
+            ridge_indices_cross = np.append(ridge_indices_cross, peaks)
+            ridge_indices_disp  = np.append(ridge_indices_disp, np.ones(peaks.shape[0]) * i)
+        #-----------------------------------------------------
+        return ridge_indices_cross, ridge_indices_disp
+
+
+    def find_order_outliers(self, cen_disp, ref_cen_cross, all_orders_x, all_orders_y, order_width,\
+                              disp_gap_tol):
+        """
+        This utility takes the found reference positions in cross dispersion and the traced ridges and 
+        locate all the outliers defined by 'order_width' threshold. If center_row is not an integer this
+        will fail! 
+        """
+        # To simplify the code we make some abbreviations:
+        x      = np.unique(all_orders_x)
+        y_last = ref_cen_cross 
+        x_last = x[cen_disp]
+        cross_gap_tol = int(order_width/2.)
+        # Placeholders for outliers:
+        cross = []
+        disp  = []
+        # Outliers on the left side of cen_disp:
+        for xi in x[cen_disp:]:
+            index_xi = all_orders_x == xi
+            orders_y = all_orders_y[index_xi]
+            min_dist_index = np.argmin(np.abs(orders_y - y_last))
+            new_y_pos = orders_y[min_dist_index]
+            if (np.abs(new_y_pos - y_last) < cross_gap_tol) & (np.abs(xi - x_last) < disp_gap_tol):
+                cross.append(new_y_pos)
+                y_last = cross[-1]
+                disp.append(xi)
+                x_last = disp[-1]
+        y_last = ref_cen_cross 
+        x_last = x[cen_disp]
+        # Outliers on the right side of cen_disp:
+        for xi in x[cen_disp-1::-1]:
+            index_xi = all_orders_x == xi
+            orders_y = all_orders_y[index_xi]
+            min_dist_index = np.argmin(np.abs(orders_y - y_last))
+            new_y_pos = orders_y[min_dist_index]
+            if (np.abs(new_y_pos - y_last) < cross_gap_tol) & (np.abs(xi - x_last) < disp_gap_tol):
+                cross.append(new_y_pos)
+                y_last = cross[-1]
+                disp.append(xi)
+                x_last = disp[-1]
+        index = np.argsort(disp)
+        #---------------------------------------------------
+        return np.array(cross)[index], np.array(disp)[index]
+
+    
+#--------------------------------------------------------------#
+#                PARSING COMMAND-LINE ARGUMENTS                #
+#--------------------------------------------------------------#
+
+# Initialize input parameters:
+argm = 4             # Max number of arguments parsed
+argv = sys.argv      # Arguments parsed to pipeline
+argc = len(argv)     # Number of arguments parsed to pipeline
+# Help usage function:
+def help():
+    print(Fore.BLUE+Style.BRIGHT+"""Software : aLfOsc Long sLIt sPectroscOpy Pipeline (LOLLIPOP)
+   Usage : %s [-p] [-r] <path> 
+      -p : plot option
+      -r : redo option"""% argv[0][2:]+Style.RESET_ALL)
+if argc==1: help(); sys.exit()
+# Check for obvious wrong parsing:
+# - Parsing "lollipop"
+# - Parsing too many arguments
+# - Parsing "lollipop -p"
+# - Parsing "lollipop -r"
+# - Parsing "lollipop -p -r"
+# - Parsing "lollipop -r -p"
+if argc>argm+1 or \
+   argv[1]=='-p' and argc==2 or \
+   argv[1]=='-r' and argc==2 or \
+   argv[1]=='-p' and argv[2]=='-r' and argc==3 or \
+   argv[1]=='-r' and argv[2]=='-p' and argc==3:
+   print(Fore.RED+Style.BRIGHT+'[ERROR]: Wrong input!'+Style.RESET_ALL)
+   help(); sys.exit()
+# Check parsed optional arguments:
+try:
+    opts, args = getopt.getopt(argv[1:], 'pr')
+except getopt.error:
+    sys.stdout = sys.stderr
+    print(Fore.RED+Style.BRIGHT+'[ERROR]: Wrong input!'+Style.RESET_ALL)
+    help(); sys.exit()
+for opt, arg in opts:
+    # Parsing True argument:
+    if opt == '-p': plot = True
+    if opt == '-r': redo = True
+# Checking plot argument:
+try: plot
+except NameError: plot = False
+else: pass 
+# Checking redo argument:
+try: redo
+except NameError: redo = False
+else: pass
+# Parsing the path:
+if argc==2: path = argv[1]
+if argc==3: path = argv[2]
+if argc==4: path = argv[3]
+    
+#--------------------------------------------------------------#
+#                      TOP-LAYER PIPELINE                      #
+#--------------------------------------------------------------#
+
+print(Back.BLUE+Style.BRIGHT+\
+      '    ___/\___                                               ___/\___    '+Style.RESET_ALL)
+print(Back.BLUE+Style.BRIGHT+\
+      '    \      /                  --------                     \      /    '+Style.RESET_ALL)
+print(Back.RED+Style.BRIGHT+\
+      '       NOT                    LOLLIPOP                        NOT      '+Style.RESET_ALL)
+print(Back.BLUE+Style.BRIGHT+\
+      '    /__  __\                  --------                     /__  __\    '+Style.RESET_ALL)
+print(Back.BLUE+Style.BRIGHT+\
+      '       \/        aLfOsc Long sLIt sPectroscOpy Pipeline       \/       '+Style.RESET_ALL)
+print(Back.BLUE+Style.BRIGHT+\
+      '       ||                                                     ||       '+Style.RESET_ALL)
+# IMPORT CLASS AND FUNCTIONS:
+n = MasterClass(plot, redo, path)
+# IMAGE REDUCTION:
+print(Fore.GREEN+Style.BRIGHT+'1/: IMAGE REDUCTION: Loading images..'+Style.RESET_ALL)
+n.image_reduction()
+# # TRACE ORDERS:
+#print(Fore.GREEN+Style.BRIGHT+'2/: TRACE ORDERS'+Style.RESET_ALL)
+#n.trace_orders()
+# # SPECTRAL EXTRACTION:
+# print(Fore.GREEN+Style.BRIGHT+'3/: SPECTRAL EXTRACTION'+Style.RESET_ALL)
+# n.spectral_extraction()
+# # WAVELENGTH CALIBRATION:
+# print(Fore.GREEN+Style.BRIGHT+'4/: WAVELENGTH CALIBRATION'+Style.RESET_ALL)
+# n.wavelength_calib()
+# # RV CORRECTION:
+# print(Fore.GREEN+Style.BRIGHT+'6/: RV CORRECTION'+Style.RESET_ALL)
+# n.scrunch_and_merge()
+# # SAFNDARD SAFR NORMALIZATION:
+# print(Fore.GREEN+Style.BRIGHT+'7/: CONTINUUM NORMALIZATION'+Style.RESET_ALL)
+# n.scrunch_and_merge()
+# #---------------------------
+# print(Back.BLUE+Style.BRIGHT+\
+#       '                                FINITO!                               '+Style.RESET_ALL)
